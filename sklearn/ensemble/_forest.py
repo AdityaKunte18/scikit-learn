@@ -45,6 +45,9 @@ import numpy as np
 from scipy.sparse import hstack as sparse_hstack
 from scipy.sparse import issparse
 
+from multiprocessing import Manager
+
+
 from ..base import (
     ClassifierMixin,
     MultiOutputMixin,
@@ -485,8 +488,8 @@ class BaseForest(MultiOutputMixin, BaseEnsemble, metaclass=ABCMeta):
             trees = Parallel(
                 n_jobs=self.n_jobs,
                 verbose=self.verbose,
-                prefer="threads",
-            )(
+                backend="loky"
+            )(  
                 delayed(_parallel_build_trees)(
                     t,
                     self.bootstrap,
@@ -944,16 +947,28 @@ class ForestClassifier(ClassifierMixin, BaseForest, metaclass=ABCMeta):
         # Assign chunk of trees to jobs
         n_jobs, _, _ = _partition_estimators(self.n_estimators, self.n_jobs)
 
-        # avoid storing the output of every estimator by summing them here
+        # Initialize shared memory arrays with the correct shape
+        manager = Manager()
         all_proba = [
-            np.zeros((X.shape[0], j), dtype=np.float64)
+            manager.list([np.zeros(X.shape[0], dtype=np.float64) for _ in range(j)])
             for j in np.atleast_1d(self.n_classes_)
         ]
-        lock = threading.Lock()
-        Parallel(n_jobs=n_jobs, verbose=self.verbose, require="sharedmem")(
-            delayed(_accumulate_prediction)(e.predict_proba, X, all_proba, lock)
+        lock = manager.Lock()
+
+        def _accumulate_prediction_with_lock(predict_proba, X, all_proba, lock):
+            """Helper function for Parallel processing"""
+            proba = predict_proba(X)
+            with lock:
+                for i in range(len(all_proba)):
+                    all_proba[i] = np.add(all_proba[i], proba[:, i])
+    
+        Parallel(n_jobs=n_jobs, verbose=self.verbose, backend="loky")(
+            delayed(_accumulate_prediction_with_lock)(e.predict_proba, X, all_proba, lock)
             for e in self.estimators_
         )
+
+        # Convert shared memory lists back to numpy arrays and normalize
+        all_proba = [np.array(list(proba)).reshape((X.shape[0], j)) for proba, j in zip(all_proba, np.atleast_1d(self.n_classes_))]
 
         for proba in all_proba:
             proba /= len(self.estimators_)
